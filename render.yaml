@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: recusapp-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python backend_api_gratuit.py
