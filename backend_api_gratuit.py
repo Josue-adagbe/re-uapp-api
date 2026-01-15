@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import hashlib
 from datetime import datetime, timedelta
 import os
 import secrets
 
 app = Flask(__name__)
+CORS(app)  # Activer CORS pour toutes les routes
 
 # Configuration
 CLE_MASTER = "RECUSAPP_BENIN_2026_SECURE"
