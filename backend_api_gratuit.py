@@ -628,4 +628,55 @@ def webhook_fedapay():
             paiement['date_paiement'] = datetime.now().isoformat()
             
             # Créer la licence
-            date_expiration = datetime.now(
+            date_expiration = datetime.now() + timedelta(days=365)
+            licences[code] = {
+                "entreprise": paiement['entreprise'],
+                "device_id": paiement['device_id'],
+                "date_activation": datetime.now().isoformat(),
+                "date_expiration": date_expiration.isoformat(),
+                "statut": "active",
+                "fedapay_id": fedapay_id
+            }
+            
+            return jsonify({
+                "success": True,
+                "message": "Paiement traité"
+            })
+        
+        return jsonify({
+            "success": False,
+            "message": "Transaction non trouvée ou statut invalide"
+        }), 400
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+# =========================
+# STATISTIQUES
+# =========================
+
+@app.route('/stats')
+def statistiques():
+    """Statistiques pour le vendeur"""
+    total_paiements = len([p for p in paiements.values() if p['statut'] == 'payé'])
+    total_revenus = total_paiements * PRIX_LICENCE
+    
+    return jsonify({
+        "total_paiements": total_paiements,
+        "total_revenus": total_revenus,
+        "licences_actives": len(licences),
+        "paiements_en_attente": len([p for p in paiements.values() if p['statut'] == 'en_attente']),
+        "prix_licence": PRIX_LICENCE
+    })
+
+# =========================
+# DÉMARRAGE
+# =========================
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+           
