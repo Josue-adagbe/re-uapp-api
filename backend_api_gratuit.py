@@ -1,19 +1,29 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 import hashlib
 from datetime import datetime, timedelta
 import os
 import secrets
+import requests
+import hmac
 
 app = Flask(__name__)
-CORS(app)  # Activer CORS pour toutes les routes
+CORS(app)
 
 # Configuration
 CLE_MASTER = "RECUSAPP_BENIN_2026_SECURE"
 PRIX_LICENCE = 2500
-FEDAPAY_SECRET_KEY = os.environ.get('FEDAPAY_SECRET_KEY', '')
+DUREE_LICENCE_JOURS = 365
 
-# Base de données en mémoire (sera remplacé par une vraie DB plus tard)
+# Clés FedaPay (on utilisera sandbox pour les tests)
+FEDAPAY_SECRET_KEY = os.environ.get('FEDAPAY_SECRET_KEY', 'sk_sandbox_test')
+FEDAPAY_PUBLIC_KEY = os.environ.get('FEDAPAY_PUBLIC_KEY', 'pk_sandbox_test')
+FEDAPAY_MODE = os.environ.get('FEDAPAY_MODE', 'sandbox')  # 'sandbox' ou 'live'
+
+# URLs FedaPay
+FEDAPAY_API_URL = "https://sandbox-api.fedapay.com/v1" if FEDAPAY_MODE == 'sandbox' else "https://api.fedapay.com/v1"
+
+# Base de données en mémoire
 paiements = {}
 licences = {}
 
@@ -37,7 +47,6 @@ def valider_code_activation(code, entreprise, device_id):
     """Valide un code d'activation"""
     code_nettoye = code.strip().upper().replace("-", "")
     
-    # Vérifier les codes des 30 derniers jours
     for i in range(30):
         date_test = datetime.now() - timedelta(days=i)
         date_str = date_test.strftime("%Y%m%d")
@@ -52,6 +61,93 @@ def valider_code_activation(code, entreprise, device_id):
     return False
 
 # =========================
+# FEDAPAY - FONCTIONS
+# =========================
+
+def creer_transaction_fedapay(montant, entreprise, device_id, callback_url):
+    """
+    Crée une transaction FedaPay
+    
+    Retourne:
+    {
+        "success": True,
+        "transaction_id": "xxx",
+        "checkout_url": "https://checkout.fedapay.com/xxx"
+    }
+    """
+    try:
+        headers = {
+            "Authorization": f"Bearer {FEDAPAY_SECRET_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "description": f"Licence RecusApp - {entreprise}",
+            "amount": montant,
+            "currency": {
+                "iso": "XOF"
+            },
+            "callback_url": callback_url,
+            "customer": {
+                "firstname": entreprise,
+                "lastname": "Client",
+                "email": f"client-{device_id[:8]}@recusapp.com"
+            }
+        }
+        
+        response = requests.post(
+            f"{FEDAPAY_API_URL}/transactions",
+            headers=headers,
+            json=data,
+            timeout=10
+        )
+        
+        if response.status_code in [200, 201]:
+            result = response.json()
+            transaction = result.get('v1/transaction', result)
+            
+            # Générer le token pour obtenir l'URL de checkout
+            token_response = requests.post(
+                f"{FEDAPAY_API_URL}/transactions/{transaction['id']}/token",
+                headers=headers,
+                timeout=10
+            )
+            
+            if token_response.status_code == 200:
+                token_data = token_response.json()
+                checkout_url = token_data.get('url', token_data.get('token', {}).get('url'))
+                
+                return {
+                    "success": True,
+                    "transaction_id": transaction['id'],
+                    "checkout_url": checkout_url
+                }
+        
+        return {
+            "success": False,
+            "error": f"Erreur FedaPay: {response.text}"
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Erreur de connexion: {str(e)}"
+        }
+
+def verifier_signature_webhook(payload, signature):
+    """Vérifie la signature du webhook FedaPay"""
+    try:
+        expected_signature = hmac.new(
+            FEDAPAY_SECRET_KEY.encode(),
+            payload.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        return hmac.compare_digest(signature, expected_signature)
+    except:
+        return False
+
+# =========================
 # ROUTES DE BASE
 # =========================
 
@@ -59,14 +155,15 @@ def valider_code_activation(code, entreprise, device_id):
 def home():
     return jsonify({
         "app": "RecusApp API",
-        "version": "2.0",
+        "version": "3.0",
         "status": "running",
+        "fedapay_mode": FEDAPAY_MODE,
         "endpoints": {
             "/health": "Health check",
-            "/paiement/initier": "Initier un paiement",
+            "/paiement/initier": "Initier un paiement FedaPay",
             "/paiement/verifier/<transaction_id>": "Vérifier un paiement",
             "/code/valider": "Valider un code d'activation",
-            "/webhook/fedapay": "Webhook FedaPay",
+            "/webhook/fedapay": "Webhook FedaPay (automatique)",
             "/stats": "Statistiques"
         }
     })
@@ -75,22 +172,14 @@ def home():
 def health():
     return jsonify({"status": "ok"})
 
-@app.route('/test')
-def test():
-    return jsonify({
-        "message": "API fonctionne!",
-        "timestamp": datetime.now().isoformat(),
-        "fedapay_configured": bool(FEDAPAY_SECRET_KEY)
-    })
-
 # =========================
-# ROUTES DE PAIEMENT
+# PAIEMENT AUTOMATIQUE FEDAPAY
 # =========================
 
 @app.route('/paiement/initier', methods=['POST'])
 def initier_paiement():
     """
-    Initie un paiement
+    Initie un paiement automatique via FedaPay
     
     POST Body:
     {
@@ -102,7 +191,7 @@ def initier_paiement():
     {
         "success": true,
         "transaction_id": "xxx",
-        "url_paiement": "https://...",
+        "checkout_url": "https://checkout.fedapay.com/xxx",
         "montant": 2500
     }
     """
@@ -117,28 +206,39 @@ def initier_paiement():
                 "error": "Données manquantes"
             }), 400
         
-        # Générer un ID de transaction unique
-        transaction_id = generer_transaction_id()
+        # Générer un ID local
+        local_transaction_id = generer_transaction_id()
         
-        # Sauvegarder la demande de paiement
-        paiements[transaction_id] = {
+        # Créer la transaction FedaPay
+        callback_url = f"https://re-uapp-api.onrender.com/webhook/fedapay"
+        
+        fedapay_result = creer_transaction_fedapay(
+            PRIX_LICENCE,
+            entreprise,
+            device_id,
+            callback_url
+        )
+        
+        if not fedapay_result.get('success'):
+            return jsonify(fedapay_result), 500
+        
+        # Sauvegarder la transaction
+        paiements[local_transaction_id] = {
             "entreprise": entreprise,
             "device_id": device_id,
             "montant": PRIX_LICENCE,
             "statut": "en_attente",
+            "fedapay_transaction_id": fedapay_result['transaction_id'],
             "date_creation": datetime.now().isoformat(),
             "code": None
         }
         
-        # URL de la page de paiement
-        url_paiement = f"https://re-uapp-api.onrender.com/payer/{transaction_id}"
-        
         return jsonify({
             "success": True,
-            "transaction_id": transaction_id,
-            "url_paiement": url_paiement,
+            "transaction_id": local_transaction_id,
+            "checkout_url": fedapay_result['checkout_url'],
             "montant": PRIX_LICENCE,
-            "message": "Ouvrez cette URL pour payer"
+            "message": "Ouvrez cette URL pour payer automatiquement"
         })
     
     except Exception as e:
@@ -146,259 +246,6 @@ def initier_paiement():
             "success": False,
             "error": str(e)
         }), 500
-
-@app.route('/payer/<transaction_id>')
-def page_paiement(transaction_id):
-    """Page HTML de paiement avec instructions"""
-    
-    if transaction_id not in paiements:
-        return """
-        <html>
-        <head><title>Transaction introuvable</title></head>
-        <body style="font-family: Arial; padding: 40px; text-align: center;">
-            <h1>❌ Transaction introuvable</h1>
-            <p>Cette transaction n'existe pas ou a expiré.</p>
-        </body>
-        </html>
-        """, 404
-    
-    paiement = paiements[transaction_id]
-    
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="fr">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Paiement RecusApp</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                min-height: 100vh;
-                margin: 0;
-                padding: 20px;
-            }}
-            .container {{
-                background: white;
-                padding: 30px;
-                border-radius: 15px;
-                box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-                max-width: 450px;
-                width: 100%;
-            }}
-            h1 {{
-                color: #4CAF50;
-                margin-bottom: 10px;
-                font-size: 24px;
-            }}
-            .montant {{
-                font-size: 36px;
-                color: #FF5722;
-                font-weight: bold;
-                margin: 20px 0;
-            }}
-            .info {{
-                background: #f5f5f5;
-                padding: 15px;
-                border-radius: 8px;
-                margin: 15px 0;
-                text-align: left;
-                font-size: 14px;
-            }}
-            .numero {{
-                background: #FFF3E0;
-                padding: 15px;
-                border-radius: 8px;
-                margin: 10px 0;
-                border: 2px solid #FF9800;
-            }}
-            .numero h3 {{
-                margin: 0 0 10px 0;
-                color: #FF9800;
-                font-size: 16px;
-            }}
-            .numero p {{
-                margin: 5px 0;
-                font-size: 14px;
-            }}
-            .numero strong {{
-                font-size: 18px;
-                color: #000;
-            }}
-            button {{
-                background: #4CAF50;
-                color: white;
-                border: none;
-                padding: 15px 30px;
-                font-size: 16px;
-                border-radius: 8px;
-                cursor: pointer;
-                width: 100%;
-                margin-top: 15px;
-                font-weight: bold;
-            }}
-            button:hover {{
-                background: #45a049;
-            }}
-            .steps {{
-                background: #E8F5E9;
-                padding: 15px;
-                border-radius: 8px;
-                margin: 15px 0;
-                text-align: left;
-            }}
-            .steps h3 {{
-                margin: 0 0 10px 0;
-                color: #4CAF50;
-            }}
-            .steps ol {{
-                margin: 0;
-                padding-left: 20px;
-            }}
-            .steps li {{
-                margin: 8px 0;
-                font-size: 14px;
-            }}
-            input {{
-                width: 100%;
-                padding: 12px;
-                border: 2px solid #ddd;
-                border-radius: 8px;
-                font-size: 16px;
-                margin: 10px 0;
-                box-sizing: border-box;
-            }}
-            .activer-btn {{
-                background: #2196F3;
-            }}
-            .activer-btn:hover {{
-                background: #1976D2;
-            }}
-            #status {{
-                margin-top: 15px;
-                padding: 15px;
-                border-radius: 8px;
-                display: none;
-            }}
-            .success {{
-                background: #4CAF50;
-                color: white;
-            }}
-            .error {{
-                background: #f44336;
-                color: white;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>💳 Paiement RecusApp</h1>
-            
-            <div class="montant">{PRIX_LICENCE} FCFA</div>
-            
-            <div class="info">
-                <strong>Entreprise:</strong> {paiement['entreprise']}<br>
-                <strong>Durée:</strong> 1 an<br>
-                <strong>Transaction:</strong> {transaction_id[:12]}...
-            </div>
-            
-            <div class="steps">
-                <h3>📱 Instructions de paiement</h3>
-                <ol>
-                    <li>Envoyez <strong>{PRIX_LICENCE} FCFA</strong> à l'un des numéros ci-dessous</li>
-                    <li>Notez votre <strong>référence de transaction</strong></li>
-                    <li>Contactez-nous sur WhatsApp avec la référence</li>
-                    <li>Recevez votre code d'activation</li>
-                </ol>
-            </div>
-            
-            <div class="numero">
-                <h3>📱 MTN MOBILE MONEY</h3>
-                <p><strong>2290167004080</strong></p>
-                <p>Nom: RecusApp Benin</p>
-            </div>
-            
-            <div class="numero">
-                <h3>📱 CELTIIS CASH</h3>
-                <p><strong>2290143948122</strong></p>
-                <p>Nom: RecusApp Benin</p>
-            </div>
-            
-            <button onclick="contacterWhatsApp()">
-                💬 CONTACTER SUR WHATSAPP
-            </button>
-            
-            <hr style="margin: 25px 0; border: none; border-top: 1px solid #ddd;">
-            
-            <h3 style="margin: 15px 0; font-size: 16px;">Vous avez déjà payé ?</h3>
-            <p style="font-size: 14px; color: #666;">Entrez le code d'activation reçu :</p>
-            
-            <input type="text" id="code" placeholder="XXXX-XXXX-XXXX" maxlength="14">
-            
-            <button class="activer-btn" onclick="activerLicence()">
-                ✅ ACTIVER LA LICENCE
-            </button>
-            
-            <div id="status"></div>
-        </div>
-        
-        <script>
-            function contacterWhatsApp() {{
-                const msg = `Bonjour,\\n\\nJ'ai effectué le paiement pour RecusApp.\\n\\nEntreprise: {paiement['entreprise']}\\nID Appareil: {paiement['device_id']}\\nMontant: {PRIX_LICENCE} FCFA\\nRéférence transaction: [VOTRE REFERENCE]\\n\\nMerci de m'envoyer le code d'activation.`;
-                
-                const url = `https://wa.me/2290167004080?text=${{encodeURIComponent(msg)}}`;
-                window.open(url, '_blank');
-            }}
-            
-            function activerLicence() {{
-                const code = document.getElementById('code').value.trim();
-                const statusDiv = document.getElementById('status');
-                
-                if (!code) {{
-                    statusDiv.textContent = 'Veuillez entrer le code d\\'activation';
-                    statusDiv.className = 'error';
-                    statusDiv.style.display = 'block';
-                    return;
-                }}
-                
-                // Simuler la validation du code
-                fetch('/code/simuler-activation', {{
-                    method: 'POST',
-                    headers: {{
-                        'Content-Type': 'application/json'
-                    }},
-                    body: JSON.stringify({{
-                        transaction_id: '{transaction_id}',
-                        code: code
-                    }})
-                }})
-                .then(response => response.json())
-                .then(data => {{
-                    if (data.success) {{
-                        statusDiv.textContent = '✅ Code validé ! Retournez dans l\\'application et entrez ce code.';
-                        statusDiv.className = 'success';
-                    }} else {{
-                        statusDiv.textContent = '❌ ' + (data.error || 'Code invalide');
-                        statusDiv.className = 'error';
-                    }}
-                    statusDiv.style.display = 'block';
-                }})
-                .catch(error => {{
-                    statusDiv.textContent = '❌ Erreur de connexion';
-                    statusDiv.className = 'error';
-                    statusDiv.style.display = 'block';
-                }});
-            }}
-        </script>
-    </body>
-    </html>
-    """
-    
-    return html
 
 @app.route('/paiement/verifier/<transaction_id>')
 def verifier_paiement(transaction_id):
@@ -421,58 +268,84 @@ def verifier_paiement(transaction_id):
         "entreprise": paiement['entreprise']
     })
 
-@app.route('/paiement/confirmer', methods=['POST'])
-def confirmer_paiement():
+# =========================
+# WEBHOOK FEDAPAY (AUTOMATIQUE)
+# =========================
+
+@app.route('/webhook/fedapay', methods=['POST'])
+def webhook_fedapay():
     """
-    Confirme un paiement manuellement (pour le vendeur)
-    
-    POST Body:
-    {
-        "transaction_id": "xxx",
-        "reference_paiement": "REF123"
-    }
+    Webhook appelé automatiquement par FedaPay après paiement
+    C'est ici que la magie opère !
     """
     try:
-        data = request.json
-        transaction_id = data.get('transaction_id')
-        reference = data.get('reference_paiement', 'MANUEL')
+        # Récupérer les données
+        payload = request.get_data(as_text=True)
+        signature = request.headers.get('X-Fedapay-Signature', '')
         
-        if transaction_id not in paiements:
+        # Vérifier la signature (en production)
+        # if FEDAPAY_MODE == 'live' and not verifier_signature_webhook(payload, signature):
+        #     return jsonify({"error": "Invalid signature"}), 401
+        
+        data = request.json
+        
+        # Extraire les informations
+        event_type = data.get('entity', {}).get('event', data.get('event'))
+        transaction_data = data.get('entity', {}).get('transaction', data)
+        
+        fedapay_transaction_id = transaction_data.get('id')
+        status = transaction_data.get('status')
+        
+        # Trouver notre transaction locale
+        local_transaction = None
+        local_transaction_id = None
+        
+        for tid, paiement in paiements.items():
+            if paiement.get('fedapay_transaction_id') == fedapay_transaction_id:
+                local_transaction = paiement
+                local_transaction_id = tid
+                break
+        
+        if not local_transaction:
             return jsonify({
                 "success": False,
-                "error": "Transaction introuvable"
+                "message": "Transaction locale introuvable"
             }), 404
         
-        paiement = paiements[transaction_id]
-        
-        # Générer le code d'activation
-        code = generer_code_activation(
-            paiement['entreprise'],
-            paiement['device_id']
-        )
-        
-        # Mettre à jour le paiement
-        paiement['statut'] = 'payé'
-        paiement['code'] = code
-        paiement['reference_paiement'] = reference
-        paiement['date_paiement'] = datetime.now().isoformat()
-        
-        # Sauvegarder la licence
-        date_expiration = datetime.now() + timedelta(days=365)
-        licences[code] = {
-            "entreprise": paiement['entreprise'],
-            "device_id": paiement['device_id'],
-            "date_activation": datetime.now().isoformat(),
-            "date_expiration": date_expiration.isoformat(),
-            "statut": "active",
-            "transaction_id": transaction_id
-        }
+        # Si le paiement est approuvé
+        if status in ['approved', 'transferred']:
+            # Générer le code d'activation
+            code = generer_code_activation(
+                local_transaction['entreprise'],
+                local_transaction['device_id']
+            )
+            
+            # Mettre à jour la transaction
+            local_transaction['statut'] = 'payé'
+            local_transaction['code'] = code
+            local_transaction['date_paiement'] = datetime.now().isoformat()
+            local_transaction['fedapay_status'] = status
+            
+            # Créer la licence
+            date_expiration = datetime.now() + timedelta(days=DUREE_LICENCE_JOURS)
+            licences[code] = {
+                "entreprise": local_transaction['entreprise'],
+                "device_id": local_transaction['device_id'],
+                "date_activation": datetime.now().isoformat(),
+                "date_expiration": date_expiration.isoformat(),
+                "statut": "active",
+                "fedapay_transaction_id": fedapay_transaction_id
+            }
+            
+            return jsonify({
+                "success": True,
+                "message": "Paiement traité avec succès",
+                "code": code
+            })
         
         return jsonify({
             "success": True,
-            "code": code,
-            "expiration": date_expiration.isoformat(),
-            "message": "Paiement confirmé et code généré"
+            "message": f"Webhook reçu - Status: {status}"
         })
     
     except Exception as e:
@@ -536,9 +409,8 @@ def valider_code():
         
         # Sinon, valider avec l'algorithme
         if valider_code_activation(code, entreprise, device_id):
-            # Créer la licence si elle n'existe pas
             if code not in licences:
-                date_expiration = datetime.now() + timedelta(days=365)
+                date_expiration = datetime.now() + timedelta(days=DUREE_LICENCE_JOURS)
                 licences[code] = {
                     "entreprise": entreprise,
                     "device_id": device_id,
@@ -564,98 +436,6 @@ def valider_code():
             "error": str(e)
         }), 500
 
-@app.route('/code/simuler-activation', methods=['POST'])
-def simuler_activation():
-    """Simule l'activation d'un code (pour la page de paiement)"""
-    try:
-        data = request.json
-        code = data.get('code', '').strip().upper()
-        transaction_id = data.get('transaction_id')
-        
-        if not code:
-            return jsonify({
-                "success": False,
-                "error": "Code manquant"
-            }), 400
-        
-        # Vérifier si c'est un code valide
-        if code in licences or len(code.replace('-', '')) == 12:
-            return jsonify({
-                "success": True,
-                "message": "Code valide"
-            })
-        
-        return jsonify({
-            "success": False,
-            "error": "Code invalide"
-        }), 400
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-# =========================
-# WEBHOOK FEDAPAY
-# =========================
-
-@app.route('/webhook/fedapay', methods=['POST'])
-def webhook_fedapay():
-    """
-    Webhook appelé par FedaPay après paiement réussi
-    """
-    try:
-        data = request.json
-        
-        # À implémenter plus tard avec la vérification de signature FedaPay
-        # Pour l'instant, on accepte tous les webhooks
-        
-        transaction_id = data.get('transaction_id')
-        fedapay_id = data.get('fedapay_id')
-        status = data.get('status')
-        
-        if transaction_id in paiements and status == 'approved':
-            paiement = paiements[transaction_id]
-            
-            # Générer le code
-            code = generer_code_activation(
-                paiement['entreprise'],
-                paiement['device_id']
-            )
-            
-            paiement['statut'] = 'payé'
-            paiement['code'] = code
-            paiement['fedapay_id'] = fedapay_id
-            paiement['date_paiement'] = datetime.now().isoformat()
-            
-            # Créer la licence
-            date_expiration = datetime.now() + timedelta(days=365)
-            licences[code] = {
-                "entreprise": paiement['entreprise'],
-                "device_id": paiement['device_id'],
-                "date_activation": datetime.now().isoformat(),
-                "date_expiration": date_expiration.isoformat(),
-                "statut": "active",
-                "fedapay_id": fedapay_id
-            }
-            
-            return jsonify({
-                "success": True,
-                "message": "Paiement traité"
-            })
-        
-        return jsonify({
-            "success": False,
-            "message": "Transaction non trouvée ou statut invalide"
-        }), 400
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
 # =========================
 # STATISTIQUES
 # =========================
@@ -671,8 +451,131 @@ def statistiques():
         "total_revenus": total_revenus,
         "licences_actives": len(licences),
         "paiements_en_attente": len([p for p in paiements.values() if p['statut'] == 'en_attente']),
-        "prix_licence": PRIX_LICENCE
+        "prix_licence": PRIX_LICENCE,
+        "mode": FEDAPAY_MODE
     })
+
+# =========================
+# PAGE DE TEST
+# =========================
+
+@app.route('/test-paiement')
+def test_paiement():
+    """Page de test pour créer une transaction"""
+    html = """
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Test Paiement FedaPay</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 600px;
+                margin: 50px auto;
+                padding: 20px;
+                background: #f5f5f5;
+            }
+            .container {
+                background: white;
+                padding: 30px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #4CAF50;
+                text-align: center;
+            }
+            input {
+                width: 100%;
+                padding: 12px;
+                margin: 10px 0;
+                border: 2px solid #ddd;
+                border-radius: 5px;
+                font-size: 16px;
+                box-sizing: border-box;
+            }
+            button {
+                width: 100%;
+                padding: 15px;
+                background: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                font-size: 18px;
+                cursor: pointer;
+                margin-top: 10px;
+            }
+            button:hover {
+                background: #45a049;
+            }
+            #result {
+                margin-top: 20px;
+                padding: 15px;
+                border-radius: 5px;
+                display: none;
+            }
+            .success {
+                background: #d4edda;
+                border: 1px solid #c3e6cb;
+                color: #155724;
+            }
+            .error {
+                background: #f8d7da;
+                border: 1px solid #f5c6cb;
+                color: #721c24;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🧪 Test Paiement FedaPay</h1>
+            <p style="text-align: center; color: #666;">Mode: <strong>SANDBOX</strong></p>
+            
+            <input type="text" id="entreprise" placeholder="Nom entreprise" value="Test Boutique">
+            <input type="text" id="device_id" placeholder="ID appareil" value="TEST12345">
+            
+            <button onclick="creerPaiement()">💳 PAYER 2500 FCFA</button>
+            
+            <div id="result"></div>
+        </div>
+        
+        <script>
+            async function creerPaiement() {
+                const entreprise = document.getElementById('entreprise').value;
+                const device_id = document.getElementById('device_id').value;
+                const resultDiv = document.getElementById('result');
+                
+                try {
+                    resultDiv.textContent = '⏳ Création...';
+                    resultDiv.style.display = 'block';
+                    
+                    const response = await fetch('/paiement/initier', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ entreprise, device_id })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        resultDiv.className = 'success';
+                        resultDiv.innerHTML = '✅ Transaction créée!<br><br><a href="' + data.checkout_url + '" target="_blank"><button>Ouvrir page de paiement</button></a>';
+                    } else {
+                        resultDiv.className = 'error';
+                        resultDiv.textContent = '❌ ' + (data.error || 'Erreur');
+                    }
+                } catch (error) {
+                    resultDiv.className = 'error';
+                    resultDiv.textContent = '❌ Erreur: ' + error.message;
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
 # =========================
 # DÉMARRAGE
@@ -681,4 +584,4 @@ def statistiques():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
-           
+        
